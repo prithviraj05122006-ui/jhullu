@@ -1,0 +1,6 @@
+{
+  "name": "Cognitive Agent Pipeline",
+  "description": "An advanced Planner-Worker-Verifier autonomous agent pipeline with dynamic task decomposition, self-healing ReAct tool execution, grounded fact verification, and local/Gemini LLM support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
