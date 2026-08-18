@@ -13,15 +13,95 @@ const PORT = 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
-// Initialize Gemini Client
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
+// Initialize Gemini Client safely
+const geminiApiKey = process.env.GEMINI_API_KEY;
+let ai: GoogleGenAI | null = null;
+if (geminiApiKey) {
+  ai = new GoogleGenAI({
+    apiKey: geminiApiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
     },
-  },
-});
+  });
+}
+
+// LLM Inference helper for local llama-server / Ollama / OpenAI-compatible endpoints
+async function callLocalLLM(
+  messages: Array<{ role: string; content: string }>,
+  endpointUrl: string = 'http://localhost:8080/v1/chat/completions',
+  temperature: number = 0.2,
+  maxTokens: number = 500
+): Promise<string> {
+  const response = await fetch(endpointUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messages,
+      temperature,
+      max_tokens: maxTokens,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Local model request failed (HTTP ${response.status}): ${errorText}`);
+  }
+
+  const data = await response.json();
+  return data.choices?.[0]?.message?.content || '';
+}
+
+async function* streamLocalLLM(
+  messages: Array<{ role: string; content: string }>,
+  endpointUrl: string = 'http://localhost:8080/v1/chat/completions',
+  temperature: number = 0.3,
+  maxTokens: number = 1200
+): AsyncGenerator<string, void, unknown> {
+  const response = await fetch(endpointUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messages,
+      temperature,
+      max_tokens: maxTokens,
+      stream: true,
+    }),
+  });
+
+  if (!response.ok || !response.body) {
+    const errorText = await response.text();
+    throw new Error(`Local model stream request failed (HTTP ${response.status}): ${errorText}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith('data: ')) continue;
+      const dataStr = trimmed.substring(6).trim();
+      if (dataStr === '[DONE]') break;
+      try {
+        const json = JSON.parse(dataStr);
+        const delta = json.choices?.[0]?.delta?.content || '';
+        if (delta) yield delta;
+      } catch {
+        // ignore malformed chunks
+      }
+    }
+  }
+}
 
 // ============================================================
 // IN-MEMORY WORKSPACE & MEMORY STORE
@@ -537,6 +617,38 @@ app.post('/api/agent/stream', async (req: Request, res: Response) => {
   try {
     emit('start', { jobId, timestamp: startTime });
 
+    // Helper to query LLM (either Local llama-server or Gemini)
+    const runInference = async (
+      promptText: string,
+      systemInstruction?: string,
+      temperature = 0.2,
+      asJson = false
+    ): Promise<string> => {
+      const isLocal = config.provider === 'local_llama' || !ai;
+      const endpoint = config.endpointUrl || 'http://localhost:8080/v1/chat/completions';
+
+      if (isLocal) {
+        const msgs = [];
+        if (systemInstruction) {
+          msgs.push({ role: 'system', content: systemInstruction });
+        }
+        msgs.push(...history.slice(-4));
+        msgs.push({ role: 'user', content: promptText });
+        return await callLocalLLM(msgs, endpoint, temperature);
+      } else {
+        const fullPrompt = systemInstruction ? `${systemInstruction}\n\n${promptText}` : promptText;
+        const res = await ai.models.generateContent({
+          model: config.model || 'gemini-3.7-flash',
+          contents: fullPrompt,
+          config: {
+            temperature,
+            ...(asJson ? { responseMimeType: 'application/json' } : {}),
+          },
+        });
+        return res.text || '';
+      }
+    };
+
     // ==========================================
     // STAGE 1: INTENT ANALYSIS
     // ==========================================
@@ -562,16 +674,8 @@ Classify into JSON format:
 }
 Output ONLY the JSON object.`;
 
-      const intentRes = await ai.models.generateContent({
-        model: 'gemini-3.7-flash',
-        contents: intentPrompt,
-        config: {
-          temperature: 0.1,
-          responseMimeType: 'application/json',
-        },
-      });
-
-      const parsedIntent = extractJSON(intentRes.text || '');
+      const intentText = await runInference(intentPrompt, undefined, 0.1, true);
+      const parsedIntent = extractJSON(intentText);
       if (parsedIntent && parsedIntent.category) {
         intent = parsedIntent;
       }
@@ -611,16 +715,8 @@ Respond ONLY with a JSON object:
   ]
 }`;
 
-        const planRes = await ai.models.generateContent({
-          model: 'gemini-3.7-flash',
-          contents: planPrompt,
-          config: {
-            temperature: 0.2,
-            responseMimeType: 'application/json',
-          },
-        });
-
-        const parsedPlan = extractJSON(planRes.text || '');
+        const planText = await runInference(planPrompt, undefined, 0.2, true);
+        const parsedPlan = extractJSON(planText);
         if (parsedPlan && Array.from(parsedPlan.steps || []).length > 0) {
           steps = parsedPlan.steps;
         } else {
@@ -675,14 +771,7 @@ Respond with ONLY a JSON object representing your next tool call.`;
 
         let workerResText = '';
         try {
-          const workerRes = await ai.models.generateContent({
-            model: 'gemini-3.7-flash',
-            contents: workerPrompt,
-            config: {
-              temperature: 0.15,
-            },
-          });
-          workerResText = workerRes.text || '';
+          workerResText = await runInference(workerPrompt, undefined, 0.15);
         } catch (e: any) {
           evidenceLog.push(`[Step '${step.title}'] Worker API error: ${e.message}`);
           break;
@@ -777,20 +866,41 @@ STRICT GROUNDING RULES:
 3. Write in polished, clear, structured Markdown. Use codeblocks for created files, tables for structured findings, and callouts where helpful.
 4. DO NOT output JSON in this final answer. Synthesize a professional, comprehensive response.`;
 
-    const stream = await ai.models.generateContentStream({
-      model: 'gemini-3.7-flash',
-      contents: verifierPrompt,
-      config: {
-        temperature: 0.2,
-      },
-    });
-
     let fullAnswer = '';
-    for await (const chunk of stream) {
-      const textChunk = chunk.text || '';
-      if (textChunk) {
-        fullAnswer += textChunk;
-        emit('token', { content: textChunk });
+    const isLocal = config.provider === 'local_llama' || !ai;
+    const endpoint = config.endpointUrl || 'http://localhost:8080/v1/chat/completions';
+
+    if (isLocal) {
+      const msgs = [
+        { role: 'system', content: verifierPrompt },
+        ...history.slice(-4),
+        { role: 'user', content: message },
+      ];
+      try {
+        for await (const chunk of streamLocalLLM(msgs, endpoint, 0.25, 1500)) {
+          fullAnswer += chunk;
+          emit('token', { content: chunk });
+        }
+      } catch (err: any) {
+        // Fallback to non-streaming or graceful error message
+        fullAnswer = `### Pipeline Resolution\n\nExecution completed with ${evidenceLog.length} verified evidence items.\n\n${err.message}`;
+        emit('token', { content: fullAnswer });
+      }
+    } else {
+      const stream = await ai.models.generateContentStream({
+        model: config.model || 'gemini-3.7-flash',
+        contents: verifierPrompt,
+        config: {
+          temperature: 0.2,
+        },
+      });
+
+      for await (const chunk of stream) {
+        const textChunk = chunk.text || '';
+        if (textChunk) {
+          fullAnswer += textChunk;
+          emit('token', { content: textChunk });
+        }
       }
     }
 
